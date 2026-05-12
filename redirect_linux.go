@@ -42,6 +42,7 @@ type autoRedirect struct {
 	routeExcludeAddressSet  *[]*netipx.IPSet
 	nfqueueHandler          *nfqueueHandler
 	nfqueueEnabled          bool
+	ipsetEnabled            bool
 	redirectRouteTableIndex int
 	redirectInterfaces      []control.Interface
 	dockerFirewallMonitor   *nftables.Monitor
@@ -84,6 +85,17 @@ func (r *autoRedirect) Start() error {
 			}
 			if err != nil {
 				return E.Extend(E.Cause(err, "root permission is required for auto redirect"), os.Getenv("PATH"))
+			}
+		}
+		if len(r.tunOptions.Inet6Address) > 0 {
+			ip6path := "/system/bin/ip6tables"
+			if _, statErr := os.Stat(ip6path); statErr == nil {
+				if r.probeIP6TablesNat(ip6path) {
+					r.ip6tablesPath = ip6path
+					r.enableIPv6 = true
+				} else {
+					r.logger.Warn("ip6tables nat table not available (ip6table_nat.ko not loaded?), IPv6 redirect disabled")
+				}
 			}
 		}
 	} else {
@@ -167,6 +179,23 @@ func (r *autoRedirect) Start() error {
 			}
 		}
 	} else {
+		var handler *nfqueueHandler
+		handler, err = newNFQueueHandler(nfqueueOptions{
+			Context:    r.ctx,
+			Handler:    r.handler,
+			Logger:     r.logger,
+			Queue:      r.effectiveNFQueue(),
+			OutputMark: r.effectiveOutputMark(),
+			ResetMark:  r.effectiveResetMark(),
+		})
+		if err != nil {
+			r.logger.Warn("nfqueue not available, pre-match (bypass action) disabled: ", err)
+		} else if err = handler.Start(); err != nil {
+			r.logger.Warn("nfqueue start failed, pre-match (bypass action) disabled: ", err)
+		} else {
+			r.nfqueueHandler = handler
+			r.nfqueueEnabled = true
+		}
 		r.cleanupIPTables()
 		err = r.setupIPTables()
 		if err != nil {
@@ -197,7 +226,20 @@ func (r *autoRedirect) UpdateRouteAddressSet() {
 		if err != nil {
 			r.logger.Error("update route address set: ", err)
 		}
+	} else if r.ipsetEnabled {
+		r.iptablesUpdateIPSet()
 	}
+}
+
+func (r *autoRedirect) probeIP6TablesNat(ip6tablesPath string) bool {
+	var cmd *exec.Cmd
+	probe := ip6tablesPath + " -t nat -L OUTPUT -n"
+	if r.androidSu {
+		cmd = exec.Command(r.suPath, "-c", probe)
+	} else {
+		cmd = exec.Command(ip6tablesPath, "-t", "nat", "-L", "OUTPUT", "-n")
+	}
+	return cmd.Run() == nil
 }
 
 func (r *autoRedirect) initializeNFTables() error {
